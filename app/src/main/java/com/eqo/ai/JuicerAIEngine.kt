@@ -38,6 +38,10 @@ class JuicerAIEngine(
     private val classifyEveryNFrames: Int = DEFAULT_CLASSIFY_INTERVAL,
 ) : Closeable {
 
+    /** Dynamically adjustable cadence modulated by thermal governor (0 = disabled/paused). */
+    @Volatile
+    var activeClassifyCadence: Int = classifyEveryNFrames
+
     companion object {
         private const val TAG = "eqo.AI"
         const val MODEL_ASSET = "juicer_saliency_quant.tflite"
@@ -256,7 +260,8 @@ class JuicerAIEngine(
      * (never queued) so the frame path never blocks (P5).
      */
     private fun maybeSubmitClassifier(rgb: ByteArray) {
-        if (classifyEveryNFrames <= 0 || frameCounter % classifyEveryNFrames != 0L) return
+        val cadence = activeClassifyCadence
+        if (cadence <= 0 || frameCounter % cadence != 0L) return
         if (!classifyBusy.compareAndSet(false, true)) return
         // Copy into the worker-owned buffer: the frame thread rewrites
         // classifierSnapshot (and rgb) as soon as this call returns.

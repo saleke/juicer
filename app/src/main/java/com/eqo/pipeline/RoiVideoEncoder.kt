@@ -58,8 +58,12 @@ class RoiVideoEncoder(
     companion object {
         private const val TAG = "eqo.Encoder"
 
-        /** HEVC primary, AVC compatibility fallback (C3 F3, user decision). */
-        private val PREFERRED_MIMES = listOf(MediaFormat.MIMETYPE_VIDEO_HEVC, MediaFormat.MIMETYPE_VIDEO_AVC)
+        /** AV1 (hardware-only), HEVC primary, AVC compatibility fallback (C3 F3). */
+        private val HARDWARE_TIER_MIMES = listOf(
+            MediaFormat.MIMETYPE_VIDEO_AV1,
+            MediaFormat.MIMETYPE_VIDEO_HEVC,
+            MediaFormat.MIMETYPE_VIDEO_AVC,
+        )
 
         private const val I_FRAME_INTERVAL_S = 2.0f
         private const val DEFAULT_FRAME_RATE = 30
@@ -101,6 +105,7 @@ class RoiVideoEncoder(
     private var videoTrack = -1
     private var audioTrack = -1
     private var lastVideoPtsUs = -1L
+    private var lastAudioPtsUs = -1L
     private val encodedBytes = AtomicLong(0)
     private val framesEncoded = AtomicLong(0)
 
@@ -174,21 +179,22 @@ class RoiVideoEncoder(
 
         // --- audio passthrough track (F9): format known up-front -----------
         audioExtractor = MediaExtractor().also { ex ->
-            ex.setDataSource(context, sourceUri, null)
-            val audioIdx = (0 until ex.trackCount).firstOrNull { i ->
-                ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
-            }
+            MediaExtractorCompat.setDataSource(ex, context, sourceUri)
+            val audioIdx = selectBestAudioTrack(ex)
             if (audioIdx != null) {
                 ex.selectTrack(audioIdx)
                 audioFormat = ex.getTrackFormat(audioIdx)
                 audioBuf = ByteBuffer.allocateDirect(1 shl 20)
+                Log.i(TAG, "selected audio track index=$audioIdx mime=${audioFormat?.getString(MediaFormat.KEY_MIME)}")
+            } else {
+                Log.i(TAG, "no audio track found in source")
             }
         }
 
         // --- encoder codec: HEVC → AVC, hardware preferred (F3) ------------
         val frameRate = if (metadata.frameRate > 0) metadata.frameRate else DEFAULT_FRAME_RATE
         val (info, mime) = selectEncoderCodec(metadata.width, metadata.height)
-            ?: throw PipelineException("no hardware encoder found for ${PREFERRED_MIMES}")
+            ?: throw PipelineException("no hardware encoder found for ${HARDWARE_TIER_MIMES}")
         outMime = mime
 
         val format = MediaFormat.createVideoFormat(mime, metadata.width, metadata.height).apply {
@@ -286,7 +292,7 @@ class RoiVideoEncoder(
         codecName = codecName,
         mime = outMime,
         framesEncoded = framesEncodedTotal,
-        audioPassthrough = audioFormat != null,
+        audioPassthrough = audioTrack >= 0,
     )
 
     /** Encoded bytes so far (video + passthrough audio), for live metrics. */
@@ -384,12 +390,33 @@ class RoiVideoEncoder(
         }
     }
 
+    /**
+     * Selects the best audio track from the container, prioritizing MPEG-4
+     * natively supported codecs (AAC, Opus) over exotic formats.
+     */
+    private fun selectBestAudioTrack(ex: MediaExtractor): Int? {
+        val tracks = (0 until ex.trackCount).mapNotNull { i ->
+            val mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME)
+            if (mime?.startsWith("audio/") == true) {
+                AudioTransmuxPolicy.TrackInfo(index = i, mime = mime)
+            } else null
+        }
+        return AudioTransmuxPolicy.selectBestAudioTrack(tracks)
+    }
+
     /** Adds both tracks and starts the muxer — exactly once. */
     private fun startMuxer(videoFormat: MediaFormat) {
         if (muxerStarted) return
         val m = muxer ?: return
         videoTrack = m.addTrack(videoFormat)
-        audioFormat?.let { af -> audioTrack = m.addTrack(af) }
+        audioFormat?.let { af ->
+            runCatching {
+                audioTrack = m.addTrack(af)
+            }.onFailure { e ->
+                Log.w(TAG, "MediaMuxer rejected audio track (${af.getString(MediaFormat.KEY_MIME)}): ${e.message}; continuing video-only")
+                audioTrack = -1
+            }
+        }
         m.start()
         muxerStarted = true
         Log.i(TAG, "muxer started: videoTrack=$videoTrack audioTrack=$audioTrack")
@@ -400,6 +427,10 @@ class RoiVideoEncoder(
      * unmodified (F9). Called as the video head advances so audio and video
      * samples interleave by timestamp (standard MP4 layout) instead of the
      * whole audio track being appended after the video.
+     *
+     * Sanitizes presentation timestamps against negative values (which cause
+     * MediaMuxer to throw IllegalArgumentException: bufferInfo is invalid)
+     * and strictly enforces non-decreasing timestamp ordering.
      */
     private fun writeAudioUpTo(ptsUs: Long) {
         if (audioTrack < 0 || !muxerStarted) return
@@ -407,15 +438,36 @@ class RoiVideoEncoder(
         val m = muxer ?: return
         val buf = audioBuf ?: return
         val info = audioInfo ?: return
-        while (ex.sampleTime <= ptsUs) {
+
+        while (true) {
+            val sampleTime = ex.sampleTime
+            if (AudioTransmuxPolicy.isEof(sampleTime) || sampleTime > ptsUs) {
+                break
+            }
+
             buf.clear()
             val size = ex.readSampleData(buf, 0)
             if (size < 0) break
-            info.set(0, size, ex.sampleTime,
+
+            val effectivePts = AudioTransmuxPolicy.sanitizePresentationTimestamp(sampleTime, lastAudioPtsUs)
+
+            info.set(
+                0,
+                size,
+                effectivePts,
                 if (ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0)
-                    MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
-            m.writeSampleData(audioTrack, buf, info)
-            encodedBytes.addAndGet(size.toLong())
+                    MediaCodec.BUFFER_FLAG_KEY_FRAME else 0,
+            )
+
+            try {
+                m.writeSampleData(audioTrack, buf, info)
+                encodedBytes.addAndGet(size.toLong())
+                lastAudioPtsUs = effectivePts
+            } catch (e: Exception) {
+                Log.w(TAG, "writeSampleData audio failed: ${e.message}")
+                break
+            }
+
             if (!ex.advance()) break
         }
     }
@@ -465,15 +517,28 @@ class RoiVideoEncoder(
 
     private fun selectEncoderCodec(width: Int, height: Int): Pair<MediaCodecInfo, String>? {
         val list = MediaCodecList(MediaCodecList.ALL_CODECS)
-        for (mime in PREFERRED_MIMES) {
-            val info = HardwareCodecSelector.selectEncoder(mime, list) ?: continue
+        // 1. Try hardware-accelerated encoders in tier order: AV1 -> HEVC -> AVC
+        for (mime in HARDWARE_TIER_MIMES) {
+            val info = HardwareCodecSelector.selectHardwareOnlyEncoder(mime, list) ?: continue
             val videoCaps = try {
                 info.getCapabilitiesForType(mime).videoCapabilities
             } catch (_: IllegalArgumentException) {
                 null
             }
-            if (videoCaps?.isSizeSupported(width, height) != false) return info to mime
+            if (videoCaps?.isSizeSupported(width, height) != false) {
+                Log.i(TAG, "Selected hardware encoder: ${info.name} for $mime (${width}x${height})")
+                return info to mime
+            }
         }
+
+        // 2. Absolute last resort fallback: standard encoder selector for AVC
+        val fallbackMime = MediaFormat.MIMETYPE_VIDEO_AVC
+        val fallbackInfo = HardwareCodecSelector.selectEncoder(fallbackMime, list)
+        if (fallbackInfo != null) {
+            Log.w(TAG, "Falling back to generic encoder: ${fallbackInfo.name} for $fallbackMime")
+            return fallbackInfo to fallbackMime
+        }
+
         return null
     }
 
@@ -501,6 +566,10 @@ class RoiVideoEncoder(
      * an fd stat. 0 when both fail.
      */
     private fun querySize(uri: Uri): Long {
+        if (uri.scheme == "file" && uri.path != null) {
+            val len = java.io.File(uri.path!!).length()
+            if (len > 0L) return len
+        }
         try {
             resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
                 if (c.moveToFirst() && !c.isNull(0)) return c.getLong(0)
@@ -514,12 +583,17 @@ class RoiVideoEncoder(
         }
     }
 
-    private fun queryDisplayName(uri: Uri): String? = try {
-        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-            if (c.moveToFirst()) c.getString(0) else null
+    private fun queryDisplayName(uri: Uri): String? {
+        if (uri.scheme == "file" && uri.path != null) {
+            return java.io.File(uri.path!!).name
         }
-    } catch (_: Exception) {
-        null
+        return try {
+            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun bundleOf(key: String, value: Int): android.os.Bundle =

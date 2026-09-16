@@ -27,7 +27,14 @@ class MainActivity : ComponentActivity() {
         setContent {
             EqoTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    PipelineScreen()
+                    val vm: PipelineViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+                    androidx.compose.runtime.LaunchedEffect(intent) {
+                        val uriStr = intent?.getStringExtra(EXTRA_URI) ?: intent?.data?.toString()
+                        if (!uriStr.isNullOrBlank()) {
+                            vm.onVideoPicked(android.net.Uri.parse(uriStr))
+                        }
+                    }
+                    PipelineScreen(vm)
                 }
             }
         }

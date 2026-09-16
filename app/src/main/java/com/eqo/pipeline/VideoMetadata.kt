@@ -26,6 +26,11 @@ data class VideoMetadata(
     /** Track duration in microseconds; 0 when absent. With the file size this
      *  yields the actual average bitrate — the declared one can be wildly off. */
     val durationUs: Long = 0L,
+    val audioMime: String? = null,
+    val audioChannels: Int = 0,
+    val audioSampleRate: Int = 0,
+    val audioBitrate: Int = 0,
 ) {
     val resolution: String get() = "${width}x${height}"
+    val hasAudio: Boolean get() = audioMime != null
 }

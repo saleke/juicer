@@ -29,9 +29,10 @@ import java.util.concurrent.atomic.AtomicInteger
 class TranscodePipeline(
     context: Context,
     aiEngine: JuicerAIEngine = JuicerAIEngine(context),
+    thermalGovernor: com.eqo.thermal.JuicerThermalGovernor = com.eqo.thermal.JuicerThermalGovernor(context),
     /** Target fraction of the source bitrate (user-facing quality knob). */
     private val targetFraction: Float = 0.5f,
-) : JuicerPipeline(context, aiEngine) {
+) : JuicerPipeline(context, aiEngine, thermalGovernor) {
 
     companion object {
         private const val TAG = "eqo.Transcode"
@@ -137,12 +138,13 @@ class TranscodePipeline(
             base.copy(visualIntegrityPercent = computeVisualIntegrity(base))
         }
         val r = _result.value!!
+        val ssimStr = r.visualIntegrityPercent?.let { "%.1f%%".format(it) } ?: "n/a"
+        val savedPercentStr = "%.1f%%".format(r.savedPercent)
         Log.i(
             TAG,
-            ("transcode complete: ${r.codecName} ${r.mime} in=${r.inputBytes} out=${r.outputBytes} " +
-                "saved=${r.savedBytes} (%.1f%%) frames=${r.framesEncoded} audio=${r.audioPassthrough} " +
-                "ssim=${r.visualIntegrityPercent?.let { "%.1f%%".format(it) } ?: "n/a"}")
-                .format(r.savedPercent),
+            "transcode complete: ${r.codecName} ${r.mime} in=${r.inputBytes} out=${r.outputBytes} " +
+                "saved=${r.savedBytes} ($savedPercentStr) frames=${r.framesEncoded} audio=${r.audioPassthrough} " +
+                "ssim=$ssimStr",
         )
     }
 

@@ -99,7 +99,7 @@ class OutputFrameSampler(private val context: Context) {
 
             val ex = MediaExtractor()
             extractor = ex
-            ex.setDataSource(context, uri, null)
+            MediaExtractorCompat.setDataSource(ex, context, uri)
             val trackIndex = (0 until ex.trackCount).firstOrNull { i ->
                 ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
             } ?: return emptyMap()
@@ -107,16 +107,21 @@ class OutputFrameSampler(private val context: Context) {
             val format = ex.getTrackFormat(trackIndex)
             val mime = requireNotNull(format.getString(MediaFormat.KEY_MIME))
 
+            // Same rule as the transcode decoder: never hand KEY_ROTATION to the
+            // codec — some codecs bake it into the render transform, which would
+            // rotate this leg's snapshots relative to the encoder-leg pixels.
+            val decodeFormat = MediaFormat(format).apply { removeKey("rotation-degrees") }
+
             val selected = HardwareCodecSelector.selectDecoder(mime, MediaCodecList(MediaCodecList.ALL_CODECS))
             val mc = if (selected != null) {
                 try {
-                    MediaCodec.createByCodecName(selected.name).also { it.configure(format, renderer.surface!!, null, 0) }
+                    MediaCodec.createByCodecName(selected.name).also { it.configure(decodeFormat, renderer.surface!!, null, 0) }
                 } catch (_: Exception) {
                     null
                 }
             } else null
             val decoder = mc ?: MediaCodec.createDecoderByType(mime).also {
-                it.configure(format, renderer.surface!!, null, 0)
+                it.configure(decodeFormat, renderer.surface!!, null, 0)
             }
             codec = decoder
             decoder.start()

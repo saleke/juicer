@@ -31,5 +31,13 @@ class HardwareCodecSelectorTest {
     fun `software detection is case-insensitive`() {
         assertTrue(HardwareCodecSelector.isSoftwareName("omx.google.h264.decoder"))
         assertTrue(HardwareCodecSelector.isSoftwareName("C2.ANDROID.AVC.DECODER"))
+        assertTrue(HardwareCodecSelector.isSoftwareName("c2.android.av1.encoder"))
+    }
+
+    @Test
+    fun `av1 hardware encoders are properly recognized`() {
+        assertTrue(HardwareCodecSelector.isHardwareName("c2.qti.av1.encoder"))
+        assertTrue(HardwareCodecSelector.isHardwareName("c2.mtk.av1.encoder"))
+        assertFalse(HardwareCodecSelector.isHardwareName("c2.android.av1.encoder"))
     }
 }

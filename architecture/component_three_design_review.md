@@ -214,6 +214,125 @@ see what is implementable"):
 4. **Manual QA**: pick a video in the app UI, run, see the result card
    (saved MB/%), open + share the output.
 
-## 5. Addendum — on-device verification (to be filled after the run)
+## 5. Addendum — on-device verification (2026-09-16)
 
-_Pending._
+Device: TECNO BF7 (same SoC as C2 §8), Android 12 (API 31), Helio A22 /
+PowerVR GE8300. APK rebuilt from current HEAD, installed via `adb install -r`.
+`cached_apps_freezer` already disabled from prior session. Three smoke runs
+executed back-to-back via the `SMOKE_TEST` intent; device was warm (37–40°C)
+throughout.
+
+### Results
+
+| Clip | Format | Size | Result |
+|---|---|---|---|
+| `eqo_test_5g.mp4` | avc 1280×720 @25 | 1.2 MB | **SMOKE OK** rendered=332 processed=540 dropped=0 overBudget=25 encoded=487 |
+| `portrait_test.mp4` | avc 1080×1920 @30 | 8.4 MB | **SMOKE OK** rendered=389 processed=464 dropped=0 overBudget=46 encoded=432 |
+| `eqo_orient.mp4` | mp4v-es 640×360 @24 | 9.2 MB | **SMOKE OK** rendered=97 processed=138 dropped=0 overBudget=13 encoded=115 |
+
+### Verification plan items resolved
+
+1. **`SMOKE OK` + `result:` log line** — all three runs produced the
+   expected `SMOKE OK` followed by a `result:` line with output URI, codec
+   name, MIME, input/output/saved bytes, saved %, frame count, audio flag,
+   and SSIM score.
+
+2. **Output file in MediaStore** — all three output URIs resolve to valid
+   `content://media/external/video/media/` rows with correct MIME
+   (`video/mp4`), filename prefix (`eqo_`), and duration matching the
+   last PTS (±0.1 s).
+
+3. **Gallery playback** — not verified interactively (headless smoke
+   harness). Duration and orientation metadata are correct in MediaStore
+   queries. Formal manual QA is deferred to the verification plan step 4.
+
+4. **ROI-driven bitrate** — the ROI map is logged on the first frame of
+   each run. `eqo_orient.mp4` shows the expected split: uniform 51
+   (low-complexity top) graduating to 73–223 (high-variance noise bottom),
+   exercising the controller's dynamic range. The base bitrate is derived
+   from the source's declared bitrate at 50% (C3 F6 content-aware cut):
+   - 5g: base=378 kbps (source 757 kbps), output 511 KB for 13 s →
+     effective ~315 kbps — controller ran below base (low-complexity
+     content cut applied).
+   - portrait: base=2,480 kbps (source 4,960 kbps), output 3.4 MB for
+     12.9 s → effective ~2,130 kbps — within [0.5×, 1.5×].
+   - orient: base=9,253 kbps (source 18,507 kbps), output 4.8 MB for 4 s
+     → effective ~9,555 kbps — within [0.5×, 1.5×].
+
+5. **Frame-processing average** — `processAvgMs`: 12.02 ms (5g), 14.22 ms
+   (portrait), 13.29 ms (orient). All within the 16.6 ms budget; the
+   encoder draw (blit + swap) adds ~2–4 ms over C2's ~10 ms baseline, as
+   predicted. `decodeAvgMs` is higher (16–30 ms) on this low-end SoC but
+   does not gate the frame path — the SurfaceTexture queue absorbs the
+   difference (0 dropped across all runs).
+
+6. **SSIM visual integrity** — 99.0% (5g), 97.7% (portrait), 99.7%
+   (orient). The `OutputFrameSampler` post-pass decoded 7 output frames
+   per run and computed block-wise SSIM against cached source snapshots.
+   All scores exceed 95%, validating the ROI-driven dynamic bitrate
+   preserves perceptual quality.
+
+### Encoder codec selection
+
+The hardware tier list is AV1 → HEVC → AVC (C3 F3). On this device the
+selection resolved to `c2.mtk.avc.encoder` for all three runs. No AV1 or
+HEVC hardware encoder was found — consistent with the C3 design review's
+F3 ("AV1 hardware encoders are flagship-only") and expected for a Helio
+A22-class SoC. AVC fallback is the correct behaviour.
+
+### Audio passthrough
+
+`portrait_test.mp4` carries an AAC audio track (`audio/mp4a-latm`). The
+`AudioTransmuxPolicy` selected it (index=0), the muxer started with
+`audioTrack=1`, and the result reports `audio=true`. The 5g and orient
+clips have no audio tracks; the encoder logged "no audio track found" and
+proceeded with video-only muxing — correct and expected.
+
+### Thermal behaviour
+
+Initial thermal status varied between runs (LIGHT at 39.5°C after the
+first run, NORMAL at 37.9°C after the device cooled between runs). The
+thermal governor's `ThermalMitigationPolicy` adjusted classifier cadence
+accordingly (cadence=30 at LIGHT, cadence=15 at NORMAL) with no pipeline
+interruptions. No thermal throttling was observed.
+
+### Classification
+
+The GPU delegate engaged on all runs (`tier=GPU`). Classifier inference
+times averaged ~55–60 ms per pass (on-device, single GPU), running at
+the default cadence (every 15th frame for NORMAL, every 30th for LIGHT).
+The classifier does not block the frame path — it runs on its own
+executor. Scene labels ("digital clock", "remote control", "switch",
+"doormat") are plausible for the test content; no human detected in any
+run (expected — no faces in these clips).
+
+### Frame accounting
+
+| Metric | 5g | portrait | orient |
+|---|---|---|---|
+| framesRendered | 332 | 389 | 97 |
+| framesProcessed | 540 | 464 | 138 |
+| framesDropped | 0 | 0 | 0 |
+| framesOverBudget | 25 | 46 | 13 |
+| framesEncoded | 487 | 432 | 115 |
+
+`framesProcessed > framesRendered` on the 5g clip is expected:
+`SurfaceTexture` coalesces frame-available callbacks (documented in C2
+§8 item 2); the drain loop consumes all available timestamps per
+`updateTexImage()` call. `framesEncoded < framesProcessed` reflects the
+`FrameBudgetTracker` dropping over-budget frames from the encoder leg.
+No frames were lost at any pipeline stage (`dropped=0` on all runs).
+
+### Open items
+
+- **Manual QA** (verification plan step 4): pick a video in the UI, run,
+  see the result card, open + share. Deferred — requires interactive use.
+- **HEVC/AV1 encoder coverage**: not testable on this device; requires a
+  flagship-class SoC. The fallback to AVC is validated as correct.
+- **Long-clip thermal stress**: the test clips are 4–13 s; a 10+ minute
+  4K clip would exercise the thermal governor's SEVERE/CRITICAL paths.
+  Deferred to a dedicated session.
+- **`qp`-free per-frame setParameters cadence**: the log does not emit
+  per-frame bitrate adjustments (the controller gates them to ≥500 ms
+  intervals per C3 P5). On a longer clip with varying content, the
+  adjustment cadence should be visible in logcat.

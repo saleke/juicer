@@ -47,6 +47,19 @@ object HardwareCodecSelector {
     fun selectEncoder(mime: String, codecList: MediaCodecList): MediaCodecInfo? =
         select(codecList, mime) { info -> info.isEncoder }
 
+    /**
+     * Picks a strictly hardware-accelerated encoder for [mime].
+     * Returns null if only software encoders exist for this mime (e.g. c2.android.av1.encoder),
+     * preventing severe frame rate drops when evaluating high-tier codecs.
+     */
+    fun selectHardwareOnlyEncoder(mime: String, codecList: MediaCodecList): MediaCodecInfo? {
+        val candidates = codecList.codecInfos.filter { info ->
+            info.isEncoder && supportsType(info, mime)
+        }
+        return candidates.firstOrNull { it.isHardwareAccelerated }
+            ?: candidates.firstOrNull { isHardwareName(it.name) && !isSoftwareName(it.name) }
+    }
+
     private fun select(
         codecList: MediaCodecList,
         mime: String,

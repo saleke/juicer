@@ -9,6 +9,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import android.os.Handler
+import android.util.Log
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.view.Surface
@@ -79,6 +80,12 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
         private const val MAX_RENDER_BACKLOG = 2L
 
         private const val PACE_POLL_MS = 5L
+
+        /** Headroom added to the largest scanned sample when sizing input buffers. */
+        private const val MAX_INPUT_SLACK_BYTES = 1 shl 20
+
+        /** Upper bound on the pre-scan sample walk (~2.8 h at 30 fps). */
+        private const val MAX_SCAN_SAMPLES = 300_000
     }
 
     // ---------------------------------------------------------------- state
@@ -112,6 +119,12 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
     private var codec: MediaCodec? = null
     private var codecInfo: MediaCodecInfo? = null
 
+    /** Total video sample count from the [prepare] pre-scan; 0 when unknown. */
+    private var sampleCount = 0
+
+    /** Largest video sample (bytes) from the [prepare] pre-scan; 0 when unknown. */
+    private var scannedMaxSampleBytes = 0
+
     /** The URI passed to [prepare]; the encoder's audio-passthrough leg re-opens it. */
     protected var sourceUri: Uri? = null
 
@@ -144,6 +157,9 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
 
     private val budgetTracker = FrameBudgetTracker()
 
+    /** Thermal pacing delay injected per rendered frame to allow silicon cooling. */
+    @Volatile var thermalPaceMs: Long = 0L
+
     // =========================================================================
     // Step A + B: initialization, extraction, surface-backed hardware decoding
     // =========================================================================
@@ -165,7 +181,7 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
             sourceUri = uri
             val ex = MediaExtractor()
             extractor = ex
-            ex.setDataSource(context, uri, null)
+            MediaExtractorCompat.setDataSource(ex, context, uri)
 
             val trackIndex = (0 until ex.trackCount).firstOrNull { i ->
                 ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
@@ -219,7 +235,27 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
             ready.await()
             setupError?.let { throw PipelineException("GPU frame leg failed to start: ${it.message}", it) }
 
-            val (mediaCodec, info) = createCodec(mime, trackFormat, r.surface!!)
+            // The decoder format must NOT carry the container rotation hint
+            // (KEY_ROTATION): some codecs fold it into the rendered output
+            // (via the SurfaceTexture transform), which would double-rotate the
+            // encoded copy — we re-add the rotation only as the muxer hint from
+            // the source metadata (C3 F5), so the encoder always captures the
+            // raw coded pixels (on-device bug: camera videos came out rotated).
+            // The input buffers also need sizing to the largest sample: a sample
+            // larger than the codec's default input buffer makes readSampleData
+            // fail mid-stream, which previously ended the decode early (EOS) and
+            // silently shipped an output containing only the first seconds.
+            val (maxSampleBytes, videoSampleCount) = scanVideoSamples(ex)
+            val decoderFormat = MediaFormat(trackFormat).apply {
+                removeKey("rotation-degrees")
+                if (maxSampleBytes > 0) {
+                    setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxSampleBytes + MAX_INPUT_SLACK_BYTES)
+                }
+            }
+            sampleCount = videoSampleCount
+            scannedMaxSampleBytes = maxSampleBytes
+
+            val (mediaCodec, info) = createCodec(mime, decoderFormat, r.surface!!)
             codec = mediaCodec
             codecInfo = info
 
@@ -234,6 +270,16 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
             }
 
+            // Inspect any audio track present in the container
+            val audioIdx = (0 until ex.trackCount).firstOrNull { i ->
+                ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
+            }
+            val audioFormat = audioIdx?.let { ex.getTrackFormat(it) }
+            val audioMime = audioFormat?.getString(MediaFormat.KEY_MIME)
+            val audioChannels = audioFormat?.intOr(MediaFormat.KEY_CHANNEL_COUNT, 0) ?: 0
+            val audioSampleRate = audioFormat?.intOr(MediaFormat.KEY_SAMPLE_RATE, 0) ?: 0
+            val audioBitrate = audioFormat?.intOr(MediaFormat.KEY_BIT_RATE, 0) ?: 0
+
             val md = VideoMetadata(
                 width = width,
                 height = height,
@@ -243,6 +289,10 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
                 mime = mime,
                 rotationDegrees = rotation,
                 durationUs = durationUs,
+                audioMime = audioMime,
+                audioChannels = audioChannels,
+                audioSampleRate = audioSampleRate,
+                audioBitrate = audioBitrate,
             )
             _metadata.value = md
             prepared.set(true)
@@ -289,6 +339,29 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
         val fallback = MediaCodec.createDecoderByType(mime)
         fallback.configure(format, surface, null, 0)
         return fallback to null
+    }
+
+    /**
+     * Walks the already-selected video track once, measuring the largest sample
+     * (bytes) and the sample count without copying any data (`getSampleSize` is
+     * metadata-only). Returns `0 to 0` when the walk fails or is bounded early.
+     * Leaves the extractor positioned back at the first sample.
+     */
+    private fun scanVideoSamples(ex: MediaExtractor): Pair<Int, Int> {
+        var max = 0
+        var count = 0
+        return try {
+            ex.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            while (count < MAX_SCAN_SAMPLES && ex.sampleTime >= 0) {
+                count++
+                max = maxOf(max, ex.getSampleSize().toInt())
+                if (!ex.advance()) break
+            }
+            ex.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            max to count
+        } catch (_: Exception) {
+            0 to 0
+        }
     }
 
     // =========================================================================
@@ -338,9 +411,23 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
         val mc = codec ?: return
         try {
             mc.start()
+            // Diagnostic: the decoder's input buffer capacity vs the largest
+            // source sample determines whether readSampleData can ever underflow.
+            runCatching {
+                val caps = buildList {
+                    for (i in 0 until 8) {
+                        try {
+                            val b = mc.getInputBuffer(i) ?: break
+                            add("$i=${b.capacity()}")
+                        } catch (_: Exception) { break }
+                    }
+                }
+                Log.i("eqo.Pipeline", "decoder inputCap=[${caps.joinToString(", ")}] maxSampleBytes=$scannedMaxSampleBytes count=$sampleCount")
+            }
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var outputDone = false
+            var samplesFed = 0
             val loopStart = SystemClock.elapsedRealtimeNanos()
 
             while (!outputDone && !released.get() && _status.value != VideoPipelineStatus.ERROR) {
@@ -356,8 +443,24 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
                     val inIndex = mc.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
                     if (inIndex >= 0) {
                         val buffer = requireNotNull(mc.getInputBuffer(inIndex))
-                        val size = ex.readSampleData(buffer, 0)
+                        // A sample that overflows the codec's input buffer either
+                        // throws or returns -1. Either way, treat it as a hard
+                        // failure mid-stream — silently ending the input here made
+                        // outputs stop after the first few seconds (on-device bug
+                        // with big I-frames).
+                        val size: Int = try {
+                            ex.readSampleData(buffer, 0)
+                        } catch (e: Exception) {
+                            if (sampleCount > 0 && samplesFed < sampleCount) throw e
+                            -1
+                        }
                         if (size < 0) {
+                            if (sampleCount > 0 && samplesFed < sampleCount) {
+                                throw PipelineException(
+                                    "input underflow at sample ${samplesFed + 1}/$sampleCount " +
+                                        "(decoder buffer ${buffer.capacity()}B vs ${scannedMaxSampleBytes}B)",
+                                )
+                            }
                             mc.queueInputBuffer(
                                 inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM,
                             )
@@ -367,6 +470,7 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
                                 MediaCodec.BUFFER_FLAG_KEY_FRAME
                             } else 0
                             mc.queueInputBuffer(inIndex, 0, size, ex.sampleTime, flags)
+                            samplesFed++
                             ex.advance()
                         }
                     }
@@ -387,6 +491,9 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
                             decodeNanosAvg = (SystemClock.elapsedRealtimeNanos() - loopStart) /
                                 max(1L, rendered),
                         )
+                        if (thermalPaceMs > 0L) {
+                            delay(thermalPaceMs)
+                        }
                         // Component 3 pacing: the SurfaceTexture queue drops
                         // frames (latest-wins) when the consumer lags, which
                         // silently thins the encoded output (observed 36%
@@ -671,7 +778,9 @@ private fun MediaFormat.intOr(key: String, default: Int): Int {
         try {
             getFloat(key).toInt()
         } catch (_: ClassCastException) {
-            default
+            // Some extractors expose numeric keys (e.g. "rotation-degrees") as
+            // Java Strings — dropping those silently turned camera rotation into 0.
+            getString(key)?.trim()?.toIntOrNull() ?: default
         }
     }
 }
@@ -685,7 +794,7 @@ private fun MediaFormat.longOr(key: String, default: Long): Long {
         try {
             getInteger(key).toLong()
         } catch (_: ClassCastException) {
-            default
+            getString(key)?.trim()?.toLongOrNull() ?: default
         }
     }
 }
