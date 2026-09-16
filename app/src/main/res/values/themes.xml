@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Pure-Compose app: the XML theme only needs to provide a windowless base style. -->
+    <style name="Theme.Eqo" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
