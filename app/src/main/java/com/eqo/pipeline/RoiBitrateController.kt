@@ -19,34 +19,49 @@ package com.eqo.pipeline
  * - **content-aware base budgeting** (component_three.md NEW §1): during the
  *   first [complexityWindowMs] of the run the smoothed ROI mean doubles as a
  *   complexity score; if the content is genuinely low-complexity (a lecture,
- *   a screen recording), the base itself is cut by up to [maxBaseReduction]
- *   once, so the whole run budgets like an 800 kbps encode instead of a
- *   4 Mbps one. The window can't literally pre-scan before encoding (frames
- *   are GPU-resident and unbufferable), so the first window runs at the
- *   source-derived base — a ~2 s prefix at the higher rate, negligible in
- *   size (design decision, C3 §3b).
+ *   a screen recording), the base itself is cut — but *gradually and
+ *   reversibly*: after the window the base eases toward the complexity-derived
+ *   target at a per-frame step, and can rise again if the content gets busy.
+ *   This replaces an earlier one-shot, permanent cut (a calm 10 s intro used
+ *   to halve the base for the whole run — the "light-switch" blur the user
+ *   reported). The [floorBitrate] (a perceptual BPP floor, the public-API
+ *   stand-in for a QP cap, C3 F1) stops the base, and the emitted target,
+ *   from collapsing below what reads as "sharp enough".
  *
  * Deliberately free of any Android dependency so it is unit-testable on the
  * JVM, following the [FrameBudgetTracker] pattern.
  *
  * @param baseBitrate        Center of the adjustment range, bits per second.
+ * @param floorBitrate       Absolute minimum for the base and emitted targets
+ *                           (perceptual floor; 0 disables). Never overrides
+ *                           the budget ceiling — the caller derives it to be
+ *                           ≤ the source budget.
  * @param minAdjustIntervalMs Minimum wall time between emitted adjustments.
  * @param minRelativeDelta   Minimum |target − applied| / applied to emit.
  * @param emaAlpha           Smoothing factor for the ROI mean (per frame).
- * @param complexityWindowMs How long to accumulate complexity before the
- *                           one-time base-budgeting decision.
+ * @param complexityWindowMs How long to accumulate complexity before base
+ *                           adaptation begins.
+ * @param baseAdaptAlpha     Per-frame easing of the base toward its target.
  */
 class RoiBitrateController(
     baseBitrate: Int,
+    private val floorBitrate: Int = 0,
     private val minAdjustIntervalMs: Long = DEFAULT_ADJUST_INTERVAL_MS,
     private val minRelativeDelta: Float = DEFAULT_MIN_RELATIVE_DELTA,
     private val emaAlpha: Float = DEFAULT_EMA_ALPHA,
     private val complexityWindowMs: Long = DEFAULT_COMPLEXITY_WINDOW_MS,
+    private val baseAdaptAlpha: Float = DEFAULT_BASE_ADAPT_ALPHA,
 ) {
     companion object {
         const val DEFAULT_ADJUST_INTERVAL_MS = 500L
         const val DEFAULT_MIN_RELATIVE_DELTA = 0.10f
         const val DEFAULT_EMA_ALPHA = 0.1f
+
+        /** Per-frame easing of the base toward its complexity target. */
+        const val DEFAULT_BASE_ADAPT_ALPHA = 0.02f
+
+        /** Faster easing when complexity returns (busy scene recovery). */
+        const val BASE_RISE_ALPHA = 0.08f
 
         /** Target = effectiveBase × ([MIN_GAIN] + [GAIN_SPAN] × smoothedRoi), clamped. */
         const val MIN_GAIN = 0.7f
@@ -57,21 +72,24 @@ class RoiBitrateController(
         /** Below this smoothed ROI mean the content counts as low-complexity. */
         const val LOW_COMPLEXITY_THRESHOLD = 0.25f
 
-        /** One-time base cut for zero-complexity content (NEW §1: up to −50%). */
+        /** Base cut for zero-complexity content (NEW §1: up to −50%). */
         const val MAX_BASE_REDUCTION = 0.5f
 
         const val DEFAULT_COMPLEXITY_WINDOW_MS = 2_000L
     }
 
-    /** The base after the complexity-window decision (starts at the input base). */
+    /** The base at run start — the reference for every later complexity target. */
+    private val initialBase: Int = baseBitrate
+
+    /** The base after complexity adaptation (starts at the input base). */
     var baseBitrate: Int = baseBitrate
         private set
 
     private var smoothedRoi = Float.NaN
+    private var smoothedComplexity = Float.NaN
     private var appliedBitrate: Int = baseBitrate
     private var lastAdjustMs = Long.MIN_VALUE
     private var startedMs = Long.MIN_VALUE
-    private var baseAdjusted = false
 
     /** Bitrate currently applied to the encoder (the base until first emit). */
     val currentBitrate: Int get() = appliedBitrate
@@ -82,13 +100,30 @@ class RoiBitrateController(
      * should be emitted (cadence or delta gate). Must be called once per
      * encoded frame, in order.
      */
-    fun onFrame(roiMean: Float, nowMs: Long): Int? {
+    /**
+     * Feed one frame's ROI means (0..1). Returns the new bitrate in bits per
+     * second to apply via `MediaCodec.setParameters`, or null when no change
+     * should be emitted (cadence or delta gate). Must be called once per
+     * encoded frame, in order.
+     *
+     * Two separate aggregates:
+     * - [roiMean] is the *detail-weighted* mean — drives the live bitrate
+     *   target (bits go where the detail is);
+     * - [overallComplexity] is the *plain* mean of the whole map — drives the
+     *   low-complexity base cut, so a sparse slide is judged by total content
+     *   (cheap) not by its one sharp corner. Defaults to [roiMean] for
+     *   callers/tests that only feed one signal.
+     */
+    fun onFrame(roiMean: Float, nowMs: Long, overallComplexity: Float = roiMean): Int? {
         if (startedMs == Long.MIN_VALUE) startedMs = nowMs
         smoothedRoi =
             if (smoothedRoi.isNaN()) roiMean
             else smoothedRoi + emaAlpha * (roiMean - smoothedRoi)
+        smoothedComplexity =
+            if (smoothedComplexity.isNaN()) overallComplexity
+            else smoothedComplexity + emaAlpha * (overallComplexity - smoothedComplexity)
 
-        maybeApplyComplexityVerdict(nowMs)
+        maybeAdaptBase(nowMs)
 
         val target = targetFor(smoothedRoi)
 
@@ -101,31 +136,44 @@ class RoiBitrateController(
     }
 
     /**
-     * Content-aware base budgeting: once, at the end of the complexity
-     * window, low-complexity content gets the base cut (up to
-     * [MAX_BASE_REDUCTION], linear in how far below the threshold it sits).
-     * The verdict re-bases [appliedBitrate] too, so the next emitted target
-     * is computed against the reduced base.
+     * Content-aware base budgeting (NEW §1), *continuous and reversible*:
+     * after the complexity window the base eases toward a complexity-derived
+     * target at [baseAdaptAlpha] per frame, so a calm intro drifts the budget
+     * down gracefully and a busy scene later pulls it back up — no permanent
+     * one-shot cut. If content is at or above [LOW_COMPLEXITY_THRESHOLD] the
+     * target is the original base (scale 1.0). The perceptual [floorBitrate]
+     * binds the base (and, via [targetFor], every emitted target).
+     *
+     * The complexity score is the *overall* (plain) ROI mean — the same
+     * measure the old code used — deliberately NOT the detail-weighted one:
+     * a sparse slide scores low here even though its text is sharp, so the
+     * whole file still gets the budget cut; the detail weighting only steers
+     * *where* those bits go (see [onFrame]).
      */
-    private fun maybeApplyComplexityVerdict(nowMs: Long) {
-        if (baseAdjusted || nowMs - startedMs < complexityWindowMs) return
-        baseAdjusted = true
-        val complexity = smoothedRoi.coerceIn(0f, 1f)
-        if (complexity >= LOW_COMPLEXITY_THRESHOLD) return
-        val severity = 1f - complexity / LOW_COMPLEXITY_THRESHOLD // 0..1
-        val scale = 1f - MAX_BASE_REDUCTION * severity
-        val newBase = (baseBitrate * scale).toInt()
-        if (newBase == baseBitrate) return
-        baseBitrate = newBase
-        appliedBitrate = newBase
-        lastAdjustMs = nowMs
+    private fun maybeAdaptBase(nowMs: Long) {
+        if (nowMs - startedMs < complexityWindowMs) return
+        val complexity = smoothedComplexity.coerceIn(0f, 1f)
+        val scale = if (complexity >= LOW_COMPLEXITY_THRESHOLD) 1f
+        else 1f - MAX_BASE_REDUCTION * (1f - complexity / LOW_COMPLEXITY_THRESHOLD)
+        val target = (initialBase * scale).toInt().coerceAtLeast(floorBitrate)
+        if (target == baseBitrate) return
+        // Asymmetric easing: a busy scene that returns pulls the base back up
+        // promptly (fast rise), while genuinely calm content descends gently —
+        // no cliff, no permanent cut.
+        val alpha = if (target > baseBitrate) BASE_RISE_ALPHA else baseAdaptAlpha
+        val step = ((target - baseBitrate) * alpha).toInt()
+        if (step != 0) baseBitrate = (baseBitrate + step).coerceAtLeast(floorBitrate)
     }
 
-    /** Maps a smoothed ROI mean to the clamped bitrate target. Pure. */
+    /**
+     * Maps a smoothed ROI mean to the clamped bitrate target. Pure. The target
+     * never falls below the perceptual [floorBitrate] (the public-API stand-in
+     * for a per-block QP cap, C3 F1).
+     */
     fun targetFor(smoothedRoi: Float): Int {
         val gain = MIN_GAIN + GAIN_SPAN * smoothedRoi.coerceIn(0f, 1f)
         val mult = gain.coerceIn(MIN_MULTIPLIER, MAX_MULTIPLIER)
-        return (baseBitrate * mult).toInt()
+        return (baseBitrate * mult).toInt().coerceAtLeast(floorBitrate)
     }
 }
 
@@ -147,9 +195,30 @@ object BitrateMath {
     /** HEVC bits per pixel for a "visually decent" fallback target. */
     const val FALLBACK_BPP = 0.07f
 
+    /**
+     * Bits per pixel that still reads as "sharp enough" on flat content
+     * (the perceptual floor; C3 F1's stand-in for a QP cap — quantizer 32
+     * on clean 720p/1080p content typically lands ~0.03–0.05 bpp for AVC).
+     * Used only as a *floor*; the budget ceiling still binds above it, so a
+     * low-bitrate source is never lifted to the floor.
+     */
+    const val QUALITY_FLOOR_BPP = 0.035f
+
     /** Absolute bounds for the derived base, bits per second. */
     const val MIN_BITRATE = 60_000
     const val MAX_BITRATE = 20_000_000
+
+    /**
+     * Perceptual floor for the run, bits per second: resolution × fps ×
+     * [QUALITY_FLOOR_BPP], clamped into absolute bounds and never above the
+     * [budgetCeiling] (so it cannot fight the savings goal on tiny sources).
+     * Feed this into [RoiBitrateController] as `floorBitrate`.
+     */
+    fun perceptualFloor(width: Int, height: Int, frameRate: Int, budgetCeiling: Int): Int {
+        val bpp = (width * height * maxOf(frameRate, 24) * QUALITY_FLOOR_BPP).toInt()
+            .coerceIn(MIN_BITRATE, MAX_BITRATE)
+        return bpp.coerceAtMost(budgetCeiling)
+    }
 
     /**
      * @param sourceBitrate Declared track bitrate in bps; 0 when absent.

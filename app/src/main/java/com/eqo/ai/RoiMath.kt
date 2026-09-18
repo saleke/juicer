@@ -10,9 +10,11 @@ package com.eqo.ai
  * Pipeline per frame:
  *  1. [varianceWeights]: 16×16 grid of luma-variance saliency.
  *  2. [smooth]: one 3×3 box pass to suppress QP thrash (P8).
- *  3. [temporalBlend]: EMA against the previous grid (P8).
- *  4. [modulateForHuman]: optional classifier-driven boost of subject regions.
- *  5. [isMostlyStatic]: mean |Δluma| test for the spec's skip-frame logic (P9).
+ *  3. [dilateCushion]: 1-cell halo around detail-rich cells (spatial memory).
+ *  4. [temporalBlendAsymmetric]: fast-attack / slow-release EMA — the grid
+ *     "remembers" recently detailed regions while subjects are still nearby.
+ *  5. [modulateForHuman]: classifier-driven boost scaled by a soft human score.
+ *  6. [isMostlyStatic]: mean |Δluma| test for the spec's skip-frame logic (P9).
  */
 object RoiMath {
 
@@ -30,6 +32,26 @@ object RoiMath {
 
     /** Temporal EMA factor: `w = (1-α)·prev + α·new`. */
     const val EMA_ALPHA = 0.3f
+
+    /**
+     * Asymmetric temporal blur: fast attack when detail rises, slow release
+     * when it falls. Release ≈ 7%/frame keeps ~50% of a region's weight for
+     * ~10 frames after the detail leaves — a smoothing "memory" so a subject
+     * that just exited a scene doesn't instantly plumb the budget (the binary
+     *-switch blur the user reported).
+     */
+    const val ASYMMETRIC_ATTACK_ALPHA = 0.5f
+    const val ASYMMETRIC_RELEASE_ALPHA = 0.07f
+
+    /** Peak weight retained by [dilateCushion] for a strong neighbor cell. */
+    const val DILATE_FALLOFF = 0.65f
+
+    /** Strong weight above which a cell seeds a dilation halo (edge proxy). */
+    const val DILATE_THRESHOLD = 0.55f
+
+    /** Soft human-score smoothing: rise fast on evidence, decay slowly off. */
+    const val HUMAN_SCORE_ATTACK_ALPHA = 0.4f
+    const val HUMAN_SCORE_RELEASE_ALPHA = 0.08f
 
     /** Mean |Δluma| below this (0–255 scale) counts as a static scene (P9). */
     const val STATIC_THRESHOLD = 2.0f
@@ -191,6 +213,70 @@ object RoiMath {
     }
 
     /**
+     * Contrast-adaptive edge dilation: every cell in `src` with weight ≥
+     * [DILATE_THRESHOLD] seeds a 1-cell halo into its 8 neighbors at
+     * [DILATE_FALLOFF] strength (a Chebyshev radius-1, classical morphological
+     * dilation). The halo raises the haloed cells above the [WEIGHT_FLOOR] so
+     * a thin textured region (a face-sized patch, an area of sharp edges)
+     * cannot collapse the global ROI mean on its own, and pushes
+     * detail-boundary cells up so the encoder keeps texture around, not just
+     * inside, the hot region. No allocation.
+     *
+     * `src` and `dst` MUST NOT alias: strong-cell detection reads `src only`
+     * (the halo must never re-seed itself on the same pass); `dst` is
+     * initialized to a copy of `src` and then raised. The caller owns both
+     * buffers (the engine dilates `gridB → gridA` per frame).
+     */
+    fun dilateCushion(src: FloatArray, dst: FloatArray) {
+        require(src.size == GRID * GRID && dst.size == GRID * GRID)
+        require(src !== dst) { "src and dst must not alias" }
+        System.arraycopy(src, 0, dst, 0, src.size)
+        for (y in 0 until GRID) {
+            for (x in 0 until GRID) {
+                val i = y * GRID + x
+                if (src[i] < DILATE_THRESHOLD) continue
+                val raised = src[i] * DILATE_FALLOFF
+                for (dy in -1..1) {
+                    val yy = y + dy
+                    if (yy !in 0 until GRID) continue
+                    for (dx in -1..1) {
+                        if (dy == 0 && dx == 0) continue
+                        val xx = x + dx
+                        if (xx !in 0 until GRID) continue
+                        val j = yy * GRID + xx
+                        if (raised > dst[j]) dst[j] = raised
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Asymmetric temporal EMA: fast inward (attack) when new detail appears,
+     * slow decay (release) when it disappears. `out = (1-α_i)·prev + α_i·new`
+     * with `α_i = attack` when `new ≥ prev` else `release`. First call (all-zero
+     * prev) copies `new`. Arrays may be reused in place (`out === prev` allowed).
+     */
+    fun temporalBlendAsymmetric(
+        prev: FloatArray,
+        new: FloatArray,
+        out: FloatArray,
+        attackAlpha: Float = ASYMMETRIC_ATTACK_ALPHA,
+        releaseAlpha: Float = ASYMMETRIC_RELEASE_ALPHA,
+    ) {
+        require(prev.size == new.size && new.size == out.size)
+        val first = prev.all { it == 0f }
+        if (first) {
+            for (i in out.indices) out[i] = new[i]
+            return
+        }
+        for (i in out.indices) {
+            val alpha = if (new[i] >= prev[i]) attackAlpha else releaseAlpha
+            out[i] = (1f - alpha) * prev[i] + alpha * new[i]
+        }
+    }
+
+    /**
      * Temporal EMA: `out = (1-α)·prev + α·new`. First call (all-zero prev) just
      * copies. Arrays may be reused in place (`out === prev` is allowed).
      */
@@ -210,17 +296,43 @@ object RoiMath {
      * Boosts weights in a centered subject region when the classifier says a
      * human is likely in frame (F7/F3). The region is deliberately generous
      * (center 12×12) because garment-only evidence localizes poorly.
+     *
+     * The boost is scaled by a *soft* human score in 0..1 (not a binary flag):
+     * a flickering classifier verdict no longer snaps the whole grid up/down —
+     * the caller smooths the score over time, so the boost feathers in and out
+     * instead of switching like a light bulb.
      */
-    fun modulateForHuman(grid: FloatArray, humanLikely: Boolean) {
-        if (!humanLikely) return
+    fun modulateForHuman(grid: FloatArray, humanScore: Float) {
+        if (humanScore <= 0f) return
         val span = 12
         val start = (GRID - span) / 2
+        val boost = (HUMAN_BOOST * humanScore.coerceIn(0f, 1f)).coerceAtMost(HUMAN_BOOST)
         for (y in start until start + span) {
             for (x in start until start + span) {
                 val i = y * GRID + x
-                grid[i] = (grid[i] + HUMAN_BOOST).coerceAtMost(1f)
+                grid[i] = (grid[i] + boost).coerceAtMost(1f)
             }
         }
+    }
+
+    /** Boolean convenience overload (a scored 1.0 / 0.0 verdict). */
+    fun modulateForHuman(grid: FloatArray, humanLikely: Boolean) =
+        modulateForHuman(grid, if (humanLikely) 1f else 0f)
+
+    /**
+     * Asymmetric scalar step used to smooth the classifier's human score:
+     * `current + α·(target − current)` with α chosen by direction — fast attack
+     * when the target rises, slow release when it falls. Keeps the *field value*
+     * here pure and JVM-testable; the engine owns the field itself.
+     */
+    fun asymmetricScoreStep(
+        current: Float,
+        target: Float,
+        attackAlpha: Float = HUMAN_SCORE_ATTACK_ALPHA,
+        releaseAlpha: Float = HUMAN_SCORE_RELEASE_ALPHA,
+    ): Float {
+        val alpha = if (target >= current) attackAlpha else releaseAlpha
+        return current + alpha * (target - current)
     }
 
     // ---------------------------------------------------------------- motion
@@ -280,6 +392,64 @@ object RoiMath {
     fun decodeFromBytes(bytes: ByteArray, out: FloatArray) {
         require(bytes.size == GRID * GRID && out.size == GRID * GRID)
         for (i in bytes.indices) out[i] = (bytes[i].toInt() and 0xFF) / 255f
+    }
+
+    /**
+     * Detail-weighted aggregate of a byte ROI map, in 0..1 (see [detailWeightedMean]).
+     * Additionally writes the *overall* mean into [overallOut] (a length-1
+     * scratch) so the caller can budget savings by total complexity while
+     * steering bits toward detail — a slideshow is "low budget, spent where
+     * the text is".
+     */
+    fun detailWeightedMeanWithOverall(map: ByteArray, histogram: IntArray, overallOut: FloatArray): Float {
+        require(overallOut.size == 1)
+        require(map.size == GRID * GRID)
+        require(histogram.size == 256)
+        java.util.Arrays.fill(histogram, 0)
+
+        var sum = 0L
+        for (b in map) {
+            val w = b.toInt() and 0xFF
+            histogram[w]++
+            sum += w
+        }
+        val overall = sum / (GRID * GRID * 255f)
+        overallOut[0] = overall
+
+        // Mean of the busiest quartile by walking the byte histogram down from
+        // 255 — no sort, one O(256) pass.
+        val top = GRID * GRID / 4
+        var remaining = top
+        var topSum = 0L
+        var level = 255
+        while (remaining > 0 && level >= 0) {
+            val take = minOf(histogram[level], remaining)
+            topSum += take * level
+            remaining -= take
+            level--
+        }
+        val topQuartile = topSum / (top * 255f)
+        return 0.5f * topQuartile + 0.5f * overall
+    }
+
+    /**
+     * Detail-weighted aggregate of a byte ROI map, in 0..1. A plain mean
+     * lets a lone subject drown in flat background — but since the ROI map
+     * only ever drives the *global* bitrate (no public QP map, C3 F1), the
+     * aggregate must still react to a small busy region. We blend the overall
+     * mean with the *mean of the top quartile* (the busiest 64 cells):
+     * `0.5·topQuartile + 0.5·overall`. A small face in a big flat scene lifts
+     * the value enough to hold a decent budget; uniformly-flat content still
+     * scores low.
+     *
+     * Hot path: prefer [detailWeightedMeanWithOverall] — it is allocation-free
+     * (the histogram AND the length-1 result scratch are caller-owned). This
+     * convenience allocates the one-element scratch per call and is for tests
+     * and diagnostics.
+     */
+    fun detailWeightedMean(map: ByteArray, histogram: IntArray): Float {
+        val scratch = FloatArray(1)
+        return detailWeightedMeanWithOverall(map, histogram, scratch)
     }
 
     /** Loads the 1000-entry ImageNet label list, one label per line. */

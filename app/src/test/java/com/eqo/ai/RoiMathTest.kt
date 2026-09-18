@@ -173,6 +173,166 @@ class RoiMathTest {
     }
 
     @Test
+    fun `human modulation scales with the soft score`() {
+        val span = 12
+        val start = (RoiMath.GRID - span) / 2
+        // score 0.5 → half the full boost.
+        val g = FloatArray(RoiMath.GRID * RoiMath.GRID)
+        RoiMath.modulateForHuman(g, humanScore = 0.5f)
+        assertEquals(RoiMath.HUMAN_BOOST * 0.5f, g[start * RoiMath.GRID + start], 0.001f)
+        // score 0 → no-op; score 1 → full boost.
+        val none = FloatArray(RoiMath.GRID * RoiMath.GRID)
+        RoiMath.modulateForHuman(none, humanScore = 0f)
+        assertTrue(none.all { it == 0f })
+        val full = FloatArray(RoiMath.GRID * RoiMath.GRID)
+        RoiMath.modulateForHuman(full, humanScore = 1f)
+        assertEquals(RoiMath.HUMAN_BOOST, full[start * RoiMath.GRID + start], 0.001f)
+        // A high cell clamps at 1.0.
+        val hot = FloatArray(RoiMath.GRID * RoiMath.GRID) { 0.9f }
+        RoiMath.modulateForHuman(hot, humanScore = 1f)
+        assertEquals(1f, hot[start * RoiMath.GRID + start], 0.001f)
+    }
+
+    @Test
+    fun `dilation cushions strong detail into its neighbors`() {
+        val src = FloatArray(RoiMath.GRID * RoiMath.GRID) { 0.2f }
+        src[7 * RoiMath.GRID + 7] = 0.9f // strong detail cell
+        val dst = FloatArray(RoiMath.GRID * RoiMath.GRID)
+        RoiMath.dilateCushion(src, dst)
+        val i = 7 * RoiMath.GRID + 7
+        assertEquals(0.9f, dst[i], 0.001f) // hot cell keeps its weight
+        // Immediate neighbor inherits the halo strength.
+        assertEquals(0.9f * RoiMath.DILATE_FALLOFF, dst[i + 1], 0.001f)
+        assertEquals(0.9f * RoiMath.DILATE_FALLOFF, dst[i + RoiMath.GRID], 0.001f)
+        // Corner far from the hot cell is untouched.
+        assertEquals(0.2f, dst[0], 0.001f)
+    }
+
+    @Test
+    fun `dilation ignores sub-threshold detail`() {
+        val src = FloatArray(RoiMath.GRID * RoiMath.GRID) { 0.4f } // below threshold
+        val dst = FloatArray(RoiMath.GRID * RoiMath.GRID)
+        RoiMath.dilateCushion(src, dst)
+        assertTrue(dst.all { it == 0.4f })
+    }
+
+    @Test
+    fun `dilation never writes outside the grid at edges`() {
+        // A strong cell in the top-left corner and bottom-right corner: its
+        // halo extends out of bounds in every direction. The halo must be
+        // clamped to the grid — an off-by-one here means dst[256] (an
+        // ArrayIndexOutOfBoundsException on the length-256 grid). Found
+        // on-device (bbb clip, frame ~15).
+        for (corner in intArrayOf(0, RoiMath.GRID - 1, (RoiMath.GRID - 1) * RoiMath.GRID, RoiMath.GRID * RoiMath.GRID - 1)) {
+            val src = FloatArray(RoiMath.GRID * RoiMath.GRID) { 0.2f }
+            src[corner] = 1f
+            val dst = FloatArray(RoiMath.GRID * RoiMath.GRID)
+            RoiMath.dilateCushion(src, dst) // must not throw
+            // In-bounds neighbors still get the halo (form a 2×2 cluster).
+            val y = corner / RoiMath.GRID
+            val x = corner % RoiMath.GRID
+            var hitCount = 0
+            for (dy in -1..1) {
+                val yy = y + dy
+                if (yy !in 0 until RoiMath.GRID) continue
+                for (dx in -1..1) {
+                    if (dy == 0 && dx == 0) continue
+                    val xx = x + dx
+                    if (xx !in 0 until RoiMath.GRID) continue
+                    if (dst[yy * RoiMath.GRID + xx] > 0.2f) hitCount++
+                }
+            }
+            assertEquals(3, hitCount) // the three in-grid neighbors
+        }
+    }
+
+    @Test
+    fun `asymmetric blend attacks fast and releases slowly`() {
+        // Attack: toward the higher value.
+        val prev = FloatArray(RoiMath.GRID * RoiMath.GRID) { 0.5f }
+        val hot = FloatArray(RoiMath.GRID * RoiMath.GRID) { 1f }
+        val out = FloatArray(RoiMath.GRID * RoiMath.GRID)
+        RoiMath.temporalBlendAsymmetric(prev, hot, out, attackAlpha = 0.5f, releaseAlpha = 0.07f)
+        assertEquals(0.75f, out[0], 0.001f) // 0.5 + 0.5·(1.0−0.5)
+
+        // Release: the value lingers (remembers) instead of snapping down.
+        val flat = FloatArray(RoiMath.GRID * RoiMath.GRID) { 0.2f }
+        RoiMath.temporalBlendAsymmetric(out, flat, out, attackAlpha = 0.5f, releaseAlpha = 0.07f)
+        val expected = 0.75f + 0.07f * (0.2f - 0.75f)
+        assertEquals(expected, out[0], 0.001f)
+        // After 20 release frames the value is still well above the target
+        // (~0.39 of a 0.2..1.0 span), where a symmetric blend (α=0.5) would
+        // have reached the target in ~3 frames. Model the exact recursion:
+        var mem = FloatArray(RoiMath.GRID * RoiMath.GRID) { 1f }
+        for (i in 0 until 20) RoiMath.temporalBlendAsymmetric(mem, flat, mem, attackAlpha = 0.5f, releaseAlpha = 0.07f)
+        var retained = 1f
+        repeat(20) { retained = 0.2f + (1f - 0.07f) * (retained - 0.2f) }
+        assertTrue("retained=$retained", retained in 0.35f..0.45f)
+        assertEquals(retained, mem[0], 0.01f)
+    }
+
+    @Test
+    fun `asymmetric blend copies on first call`() {
+        val prev = FloatArray(RoiMath.GRID * RoiMath.GRID)
+        val new = FloatArray(RoiMath.GRID * RoiMath.GRID) { 0.8f }
+        val out = FloatArray(RoiMath.GRID * RoiMath.GRID)
+        RoiMath.temporalBlendAsymmetric(prev, new, out)
+        assertTrue(out.all { it == 0.8f })
+    }
+
+    @Test
+    fun `score step rises fast and decays slowly`() {
+        // Rise: fast attack toward the target.
+        var s = 0f
+        for (i in 0 until 5) s = RoiMath.asymmetricScoreStep(s, 1f)
+        assertTrue("s=$s", s > 0.9f) // ~0.4α ⇒ >0.92 after 5 steps
+        // Decay: slow release when the evidence leaves.
+        var d = 1f
+        for (i in 0 until 30) d = RoiMath.asymmetricScoreStep(d, 0f)
+        assertTrue("d=$d", d < 0.5f) // ~0.08α ⇒ ~16% after 30 steps
+        assertTrue(d > 0.05f)        // but never a hard snap to zero
+    }
+
+    @Test
+    fun `detail weighted mean lifts a lone subject above the plain mean`() {
+        val map = ByteArray(RoiMath.GRID * RoiMath.GRID) { (0xFF * 0.2f).toInt().toByte() }
+        // One bright hot cell — the lone subject.
+        map[7 * RoiMath.GRID + 7] = (0xFF).toByte()
+        val histogram = IntArray(256)
+        val weighted = RoiMath.detailWeightedMean(map, histogram)
+
+        // Plain mean ≈ 0.203; the top-quartile mean is dragged up by the hot
+        // cell, so the weighted value must be visibly above the plain mean.
+        val plain = map.sumOf { it.toInt() and 0xFF } / (RoiMath.GRID * RoiMath.GRID * 255f)
+        assertTrue("weighted=$weighted plain=$plain", weighted > plain)
+        // Top quartile = 64 cells: the one hot cell (255) + 63 at 51. Its mean
+        // is (255 + 63·51)/(64·255), dragged well above the flat 51/255 level.
+        val topQuartile = (255 + 63 * (0xFF * 0.2f).toInt()) / (RoiMath.GRID * RoiMath.GRID / 4 * 255f)
+        assertEquals(0.5f * topQuartile + 0.5f * plain, weighted, 0.001f)
+    }
+
+    @Test
+    fun `detail weighted mean is flat content low`() {
+        val map = ByteArray(RoiMath.GRID * RoiMath.GRID) { (0xFF * 0.2f).toInt().toByte() }
+        val histogram = IntArray(256)
+        val weighted = RoiMath.detailWeightedMean(map, histogram)
+        assertEquals(0.2f, weighted, 0.01f)
+    }
+
+    @Test
+    fun `with-overall reports the plain mean separately`() {
+        val map = ByteArray(RoiMath.GRID * RoiMath.GRID) { (0xFF * 0.2f).toInt().toByte() }
+        map[7 * RoiMath.GRID + 7] = (0xFF).toByte()
+        val histogram = IntArray(256)
+        val overall = FloatArray(1)
+        val weighted = RoiMath.detailWeightedMeanWithOverall(map, histogram, overall)
+        val expectedPlain = 13260f / (RoiMath.GRID * RoiMath.GRID * 255f) // (255·51 + 255)/65280
+        assertEquals(expectedPlain, overall[0], 0.0005f)
+        // Weighted must be above the plain overall (detail lifts it).
+        assertTrue("weighted=$weighted overall=${overall[0]}", weighted > overall[0])
+    }
+
+    @Test
     fun `static scene detection uses mean luma delta`() {
         val rgbA = snapshot()
         val cellLuma = FloatArray(RoiMath.GRID * RoiMath.GRID)

@@ -13,6 +13,7 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Log
+import com.eqo.ai.RoiMath
 import com.eqo.ai.gl.SnapshotRenderer
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
@@ -109,14 +110,23 @@ class RoiVideoEncoder(
     private val encodedBytes = AtomicLong(0)
     private val framesEncoded = AtomicLong(0)
 
-    private val bitrateController = RoiBitrateController(
-        baseBitrate = BitrateMath.baseBitrate(
-            metadata.bitrate, metadata.width, metadata.height,
-            if (metadata.frameRate > 0) metadata.frameRate else DEFAULT_FRAME_RATE,
+    private val bitrateController: RoiBitrateController
+
+    init {
+        val fps = if (metadata.frameRate > 0) metadata.frameRate else DEFAULT_FRAME_RATE
+        val base = BitrateMath.baseBitrate(
+            metadata.bitrate, metadata.width, metadata.height, fps,
             actualBitrate = actualSourceBitrate(),
             fraction = targetFraction,
-        ),
-    )
+        )
+        bitrateController = RoiBitrateController(
+            baseBitrate = base,
+            floorBitrate = BitrateMath.perceptualFloor(
+                metadata.width, metadata.height, fps,
+                budgetCeiling = base,
+            ),
+        )
+    }
 
     /**
      * Actual average source bitrate: file size × 8 / track duration. The
@@ -252,12 +262,16 @@ class RoiVideoEncoder(
         if (state != State.RUNNING) return
 
         val roiMean = roiMean(roiMap)
-        val newBitrate = bitrateController.onFrame(roiMean, SystemClock.elapsedRealtime())
+        val newBitrate = bitrateController.onFrame(
+            roiMean,
+            SystemClock.elapsedRealtime(),
+            roiMeanScratch[0],
+        )
         if (newBitrate != null && state == State.RUNNING) {
             runCatching {
                 mc.setParameters(bundleOf(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, newBitrate))
             }.onSuccess {
-                Log.d(TAG, "bitrate → $newBitrate (roiMean=%.2f)".format(roiMean))
+                Log.d(TAG, "bitrate → $newBitrate (roiMean=%.2f overall=%.2f)".format(roiMean, roiMeanScratch[0]))
             }
         }
 
@@ -328,12 +342,30 @@ class RoiVideoEncoder(
 
     // -------------------------------------------------------------- internals
 
-    /** Aggregated 16×16 ROI map → 0..1 mean; a null map counts as neutral. */
+    /** Reused scratch for [RoiMath.detailWeightedMean] — no hot-path allocation. */
+    private val weightedMeanScratch = IntArray(256)
+
+    /** Reused scratch receiving the overall (plain) ROI mean. */
+    private val roiMeanScratch = FloatArray(1)
+
+    /**
+     * Aggregated 16×16 ROI map → 0..1 mean, detail-weighted: the average is
+     * biased toward the busiest cells (the top quartile), so a small face in a
+     * big frame still lifts the bitrate instead of being diluted to the flat
+     * background mean. [roiMeanScratch] is filled with the *overall* mean, so
+     * the bitrate controller can budget savings on total complexity while
+     * steering bits toward detail. A null map counts as neutral.
+     *
+     * @return the detail-weighted mean (0..1) and, via [roiMeanScratch], the
+     *   plain mean — the latter is what the low-complexity budget cut is based
+     *   on, so a sparse slide stays cheap even though its text is sharp.
+     */
     private fun roiMean(roiMap: ByteArray?): Float {
-        if (roiMap == null || roiMap.isEmpty()) return 0.5f
-        var sum = 0L
-        for (b in roiMap) sum += b.toInt() and 0xFF
-        return sum / (roiMap.size * 255f)
+        if (roiMap == null || roiMap.isEmpty()) {
+            roiMeanScratch[0] = 0.5f
+            return 0.5f
+        }
+        return RoiMath.detailWeightedMeanWithOverall(roiMap, weightedMeanScratch, roiMeanScratch)
     }
 
     private fun drainLoop() {

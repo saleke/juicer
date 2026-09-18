@@ -77,6 +77,21 @@ class JuicerAIEngine(
     var humanLikely: Boolean = false
         private set
 
+    /**
+     * Soft, continuous human evidence (0..1): the max human-adjacent class
+     * probability in the top-K, written by the classifier worker. The frame
+     * path smooths this with [RoiMath.asymmetricScoreStep] before boosting, so
+     * a flickering verdict feathers the grid up/down instead of snapping it
+     * (kills the "light swititch" blur).
+     */
+    @Volatile
+    var humanScoreTarget: Float = 0f
+        private set
+
+    /** Frame-thread-smoothed human score; the actual boost driver. */
+    var humanScore: Float = 0f
+        private set
+
     /** Latest scene category label; feeds Component 4 (videoCategory). */
     @Volatile
     var sceneCategory: String = "unknown"
@@ -214,10 +229,18 @@ class JuicerAIEngine(
         val delta = RoiMath.gridStats(rgb, cellLuma, gridA)
         val static = frameCounter > 0 && RoiMath.isMostlyStatic(delta)
         if (!static) {
-            // 3. smoothing → temporal blend → human modulation → encode
+            // 3. smoothing → dilation cushion → asymmetric temporal blend
+            //    (fast attack, slow release — the "memory") → human modulation
+            //    scaled by the smoothed score → encode. The dilation writes
+            //    into the free gridA scratch (src/dst must not alias: the halo
+            //    must never re-seed itself on the same pass).
             RoiMath.smooth(gridA, gridB)
-            RoiMath.temporalBlend(prevGrid, gridB, prevGrid)
-            RoiMath.modulateForHuman(prevGrid, humanLikely)
+            RoiMath.dilateCushion(gridB, gridA)
+            // The smoothed score rides its own asymmetric line so the boost
+            // feathers out over dozens of frames after the last human verdict.
+            humanScore = RoiMath.asymmetricScoreStep(humanScore, humanScoreTarget)
+            RoiMath.temporalBlendAsymmetric(prevGrid, gridA, prevGrid)
+            RoiMath.modulateForHuman(prevGrid, humanScore)
             RoiMath.encodeToBytes(prevGrid, roiBytes)
             onROIMapGenerated?.invoke(roiBytes)
             // P4 orientation check: dump the first frame's grid, row-major,
@@ -326,14 +349,21 @@ class JuicerAIEngine(
 
             var human = false
             var bestIdx = top.firstOrNull() ?: -1
+            var maxHumanProb = 0f
             for (idx in top) {
                 if (RoiMath.HUMAN_ADJACENT_INDICES.contains(idx) && probs[idx] > HUMAN_MIN_PROB) {
                     human = true
-                    // Prefer the human-adjacent label for the scene category too.
-                    bestIdx = idx
-                    break
+                    if (probs[idx] > maxHumanProb) {
+                        maxHumanProb = probs[idx]
+                        // Prefer the strongest human-adjacent label for the
+                        // scene category too.
+                        bestIdx = idx
+                    }
                 }
             }
+            // Soft evidence (0..1) in place of the boolean alone — the frame
+            // path smooths this so the boost ramps, never switches (F7).
+            humanScoreTarget = maxHumanProb.coerceAtMost(1f)
             humanLikely = human
             if (bestIdx in labels.indices) sceneCategory = labels[bestIdx]
             // F9/P4 diagnostics: verdict + top-1 confidence, per classification.
@@ -341,7 +371,7 @@ class JuicerAIEngine(
             Log.i(
                 TAG,
                 "classify: scene=${labels.getOrNull(topIdx) ?: "?"} " +
-                    "human=$human top1=%.3f frame=$frameCounter".format(probs[topIdx]),
+                    "human=$human humanScore=%.3f top1=%.3f frame=$frameCounter".format(maxHumanProb, probs[topIdx]),
             )
         }
     }

@@ -59,15 +59,32 @@ class RoiBitrateControllerTest {
     }
 
     @Test
-    fun `low-complexity content gets its base cut once after the window`() {
+    fun `low-complexity content eases the base down after the window, never locking`() {
         val c = RoiBitrateController(base, complexityWindowMs = 2_000)
         // Simulate a static lecture: roiMean ≈ 0.05 for 2.5 s at 30 fps.
         for (i in 0..75) c.onFrame(0.05f, i * 33L)
-        // severity = 1 − 0.05/0.25 = 0.8 ⇒ scale = 1 − 0.5·0.8 = 0.6
-        assertEquals((base * 0.6f).toInt(), c.baseBitrate)
-        // The verdict applies exactly once — the base stays put afterwards.
-        for (i in 0..30) c.onFrame(0.05f, 85_000 + i * 33L)
-        assertEquals((base * 0.6f).toInt(), c.baseBitrate)
+        // The base descended toward its target (0.6× base) but eased there —
+        // it is lower, yet far from a snapped permanent cut.
+        org.junit.Assert.assertTrue("base=${c.baseBitrate}", c.baseBitrate < base)
+        org.junit.Assert.assertTrue("base=${c.baseBitrate}", c.baseBitrate > (base * 0.5f).toInt())
+        // Still calm: the base keeps approaching the low-complexity target.
+        val before = c.baseBitrate
+        for (i in 0..120) c.onFrame(0.05f, 85_000 + i * 33L)
+        org.junit.Assert.assertTrue("base=${c.baseBitrate}", c.baseBitrate < before)
+    }
+
+    @Test
+    fun `base rebounds when complexity returns`() {
+        // A busy scene that arrives late must pull the budget back up — the
+        // opposite of the old permanent one-shot verdict (blur-by-intro).
+        val c = RoiBitrateController(base, complexityWindowMs = 2_000)
+        for (i in 0..75) c.onFrame(0.05f, i * 33L) // calm intro
+        val reduced = c.baseBitrate
+        org.junit.Assert.assertTrue(reduced < base)
+        // A busy subject returns for ~8 s.
+        for (i in 0..240) c.onFrame(0.9f, 100_000 + i * 33L)
+        org.junit.Assert.assertTrue("base=${c.baseBitrate}", c.baseBitrate > reduced)
+        org.junit.Assert.assertTrue("base=${c.baseBitrate}", c.baseBitrate <= base)
     }
 
     @Test
@@ -81,6 +98,46 @@ class RoiBitrateControllerTest {
     fun `boundary complexity is not cut`() {
         val c = RoiBitrateController(base, complexityWindowMs = 2_000)
         for (i in 0..75) c.onFrame(0.25f, i * 33L)
+        assertEquals(base, c.baseBitrate)
+    }
+
+    @Test
+    fun `target never falls below the perceptual floor`() {
+        val floor = (base * 0.75f).toInt()
+        val c = RoiBitrateController(base, floorBitrate = floor, emaAlpha = 1f)
+        assertEquals(floor, c.targetFor(0f)) // gain floor would give 0.7×base
+        assertEquals(floor, c.onFrame(0f, 0))
+    }
+
+    @Test
+    fun `base never drops below the floor during adaptation`() {
+        val floor = (base * 0.75f).toInt()
+        val c = RoiBitrateController(
+            base, floorBitrate = floor, complexityWindowMs = 0, baseAdaptAlpha = 0.5f,
+        )
+        for (i in 0..20) c.onFrame(0f, i * 33L)
+        org.junit.Assert.assertTrue("base=${c.baseBitrate}", c.baseBitrate >= floor)
+    }
+
+    @Test
+    fun `sparse-but-sharp scene cuts the base while keeping bits high`() {
+        // A slide with one sharp text region: detail-weighted mean reads high
+        // (bits go where the text is) but the *overall* mean is low, so the
+        // whole file still earns the low-complexity budget cut.
+        val c = RoiBitrateController(base, complexityWindowMs = 2_000, emaAlpha = 1f)
+        for (i in 0..75) c.onFrame(0.75f, i * 33L, overallComplexity = 0.05f)
+        // Base eased toward the low-complexity target…
+        org.junit.Assert.assertTrue("base=${c.baseBitrate}", c.baseBitrate < base)
+        // …while the emitted target still rides the (high) detail-weighted mean.
+        org.junit.Assert.assertTrue("target=${c.currentBitrate}", c.currentBitrate > (base * 0.9f).toInt())
+    }
+
+    @Test
+    fun `detail-weighted mean defaults to overall when only one signal is fed`() {
+        // Back-compat: onFrame's third argument defaults to the first. A
+        // uniformly high scene must keep the base.
+        val c = RoiBitrateController(base, complexityWindowMs = 2_000)
+        for (i in 0..75) c.onFrame(0.9f, i * 33L)
         assertEquals(base, c.baseBitrate)
     }
 }

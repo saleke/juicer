@@ -716,6 +716,7 @@ open class ZeroCopyVideoPipeline(protected val context: Context) {
 
     /** Marks the pipeline ERROR and returns the exception to (re)throw to the caller. */
     private fun pipelineFailure(message: String, cause: Throwable?): PipelineException {
+        Log.e("eqo.Pipeline", message, cause)
         _error.value = message
         _status.value = VideoPipelineStatus.ERROR
         return PipelineException(message, cause)
